@@ -1,0 +1,45 @@
+# 构建目录
+build/
+build_*/
+bin/
+lib/
+*.o
+*.so
+*.a
+*.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 大型文件/数据
+*.bin
+*.weights
+*.onnx
+*.xml
+*.bin
+*.data
+*.pth
+*.pkl
+*.png
+*.jpg
+*.bmp
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+*.txt
+
+# 临时文件
+*.tmp
+temp/
+
+# 模型文件（如果很大，不传 GitHub）
+models/
+data/
