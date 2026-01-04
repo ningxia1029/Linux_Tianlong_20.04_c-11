@@ -214,6 +214,11 @@ private:
     // 离群值检测（基于距离）
     std::vector<SpotDetectionResult> RemoveOutliers(const std::vector<SpotDetectionResult>& spots);
     
+    // 剔除中心光斑（距离几何中心过近的点，避免影响椭圆拟合）
+    std::vector<SpotDetectionResult> RemoveCenterSpots(const std::vector<SpotDetectionResult>& spots,
+                                                       const cv::Point2f& center,
+                                                       float center_threshold_ratio = 0.3f);
+    
     // 计算几何中心
     cv::Point2f ComputeGeometricCenter(const std::vector<SpotDetectionResult>& spots);
     

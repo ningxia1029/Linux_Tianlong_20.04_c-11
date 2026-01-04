@@ -3,6 +3,10 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/highgui.hpp>
 #include <string>
+#include <chrono>
+#include <iomanip>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 int main(int argc, char** argv) {
     std::cout << "========================================" << std::endl;
@@ -27,6 +31,17 @@ int main(int argc, char** argv) {
     
     // 输出目录
     std::string output_dir = "../runs/cpp_inference";
+    
+    // 创建输出目录（如果不存在）
+    struct stat info;
+    if (stat(output_dir.c_str(), &info) != 0) {
+        // 目录不存在，尝试创建
+        #ifdef _WIN32
+            system(("mkdir \"" + output_dir + "\"").c_str());
+        #else
+            system(("mkdir -p \"" + output_dir + "\"").c_str());
+        #endif
+    }
     
     // 检测参数
     float pupil_conf = 0.25f;
@@ -117,16 +132,32 @@ int main(int argc, char** argv) {
         std::cout << "成功读取图片: " << test_image_path << std::endl;
         std::cout << "图片尺寸: " << test_image.cols << "x" << test_image.rows << std::endl;
         
+        // 保存原始图片
+        std::string original_output = output_dir + "/" + image_name + "_original.jpg";
+        cv::imwrite(original_output, test_image);
+        std::cout << "原始图片已保存: " << original_output << std::endl;
+        
+        // 记录总开始时间
+        auto total_start_time = std::chrono::high_resolution_clock::now();
+        
         // 4. 瞳孔检测
         std::cout << "\n========== 步骤 4: 瞳孔检测 ==========" << std::endl;
+        auto pupil_start_time = std::chrono::high_resolution_clock::now();
+        
         PupilDetectionResult pupil_result;
         bool pupil_ok = pupil_detector->DetectPupil(test_image, pupil_result, 
                                                    pupil_conf, pupil_nms);
+        
+        auto pupil_end_time = std::chrono::high_resolution_clock::now();
+        auto pupil_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            pupil_end_time - pupil_start_time).count();
         
         if (!pupil_ok) {
             std::cerr << "错误：瞳孔检测失败！" << std::endl;
             return -1;
         }
+        
+        std::cout << "瞳孔检测耗时: " << pupil_duration << " ms" << std::endl;
         
         // 保存瞳孔检测可视化结果
         cv::Mat pupil_vis = pupil_detector->DrawResult(test_image, pupil_result);
@@ -134,13 +165,26 @@ int main(int argc, char** argv) {
         cv::imwrite(pupil_output, pupil_vis);
         std::cout << "瞳孔检测可视化已保存: " << pupil_output << std::endl;
         
-        // 5. 光斑检测与分析
+        // 保存裁剪后的图片
+        std::string cropped_output = output_dir + "/" + image_name + "_cropped.jpg";
+        cv::imwrite(cropped_output, pupil_result.cropped_image);
+        std::cout << "裁剪后图片已保存: " << cropped_output << std::endl;
+        
+        
+
+        //5. 光斑检测与分析
         std::cout << "\n========== 步骤 5: 光斑检测与分析 ==========" << std::endl;
+        auto spot_start_time = std::chrono::high_resolution_clock::now();
+        
         CornealSpotAnalysisResult spot_result;
         bool spot_ok = spot_detector->DetectAndAnalyze(
             pupil_result.cropped_image, spot_result,
             spot_conf, spot_nms, min_spots, max_spots, 
             min_aspect, max_aspect, enable_ellipse_fit);
+        
+        auto spot_end_time = std::chrono::high_resolution_clock::now();
+        auto spot_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            spot_end_time - spot_start_time).count();
         
         if (!spot_ok) {
             std::cerr << "错误：光斑检测失败！" << std::endl;
@@ -148,14 +192,28 @@ int main(int argc, char** argv) {
             return -1;
         }
         
+        std::cout << "光斑检测耗时: " << spot_duration << " ms" << std::endl;
+        
         // 保存光斑检测可视化结果
         cv::Mat spot_vis = spot_detector->DrawResult(pupil_result.cropped_image, spot_result);
         std::string spot_output = output_dir + "/" + image_name + "_spots.jpg";
         cv::imwrite(spot_output, spot_vis);
         std::cout << "光斑检测可视化已保存: " << spot_output << std::endl;
         
+        // 计算总耗时
+        auto total_end_time = std::chrono::high_resolution_clock::now();
+        auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            total_end_time - total_start_time).count();
+        
         // 6. 输出最终结果
         std::cout << "\n========== 最终结果 ==========" << std::endl;
+        std::cout << "\n【推理时间统计】" << std::endl;
+        std::cout << "  瞳孔检测: " << pupil_duration << " ms" << std::endl;
+        std::cout << "  光斑检测: " << spot_duration << " ms" << std::endl;
+        std::cout << "  总耗时: " << total_duration << " ms (" 
+                  << std::fixed << std::setprecision(2) 
+                  << total_duration / 1000.0 << " s)" << std::endl;
+        std::cout << std::endl;
         std::cout << "【瞳孔检测】" << std::endl;
         std::cout << "  中心坐标: (" << pupil_result.center.x << ", " 
                   << pupil_result.center.y << ")" << std::endl;

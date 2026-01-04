@@ -3,8 +3,43 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <limits.h>
+#include <unistd.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/dnn.hpp>
+
+// ============================================================================
+// 辅助函数：将相对路径转换为绝对路径
+// ============================================================================
+static std::string resolve_path(const std::string& path) {
+    if (path.empty()) {
+        return path;
+    }
+    
+    // 如果已经是绝对路径，直接返回
+    if (path[0] == '/') {
+        return path;
+    }
+    
+    // 获取当前工作目录
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) == nullptr) {
+        // 如果获取失败，返回原路径
+        return path;
+    }
+    
+    // 构建绝对路径
+    std::string abs_path = std::string(cwd) + "/" + path;
+    
+    // 简化路径（处理 .. 和 .）
+    char resolved[PATH_MAX];
+    if (realpath(abs_path.c_str(), resolved) != nullptr) {
+        return std::string(resolved);
+    }
+    
+    // 如果 realpath 失败，返回构建的绝对路径
+    return abs_path;
+}
 
 // ============================================================================
 // PupilDetector 实现（单例模式）
@@ -33,11 +68,13 @@ bool PupilDetector::Initialize(const std::string& model_path, int input_size) {
         return true;
     }
     
-    model_path_ = model_path;
+    // 将路径转换为绝对路径
+    model_path_ = resolve_path(model_path);
     input_size_ = input_size;
     
     try {
         std::cout << "[PupilDetector] 正在加载 OpenVINO 模型..." << std::endl;
+        std::cout << "[PupilDetector] 模型路径: " << model_path_ << std::endl;
         
         // 1. 读取模型
         std::shared_ptr<ov::Model> model = core_.read_model(model_path_);
@@ -383,11 +420,13 @@ bool CornealSpotDetector::Initialize(const std::string& model_path, int input_si
         return true;
     }
     
-    model_path_ = model_path;
+    // 将路径转换为绝对路径
+    model_path_ = resolve_path(model_path);
     input_size_ = input_size;
     
     try {
         std::cout << "[CornealSpotDetector] 正在加载 OpenVINO 模型..." << std::endl;
+        std::cout << "[CornealSpotDetector] 模型路径: " << model_path_ << std::endl;
         
         // 1. 读取模型
         std::shared_ptr<ov::Model> model = core_.read_model(model_path_);
@@ -593,6 +632,50 @@ std::vector<SpotDetectionResult> CornealSpotDetector::RemoveOutliers(
     return filtered;
 }
 
+std::vector<SpotDetectionResult> CornealSpotDetector::RemoveCenterSpots(
+    const std::vector<SpotDetectionResult>& spots,
+    const cv::Point2f& center,
+    float center_threshold_ratio) {
+
+    if (spots.size() < 3) {
+        return spots;
+    }
+
+    // 计算所有点到中心的距离
+    std::vector<float> distances;
+    for (size_t i = 0; i < spots.size(); ++i) {
+        const SpotDetectionResult& spot = spots[i];
+        float dx = spot.keypoint.x - center.x;
+        float dy = spot.keypoint.y - center.y;
+        float dist = std::sqrt(dx * dx + dy * dy);
+        distances.push_back(dist);
+    }
+
+    // 计算平均距离
+    float mean_dist = std::accumulate(distances.begin(), distances.end(), 0.0f) / distances.size();
+
+    // 中心光斑阈值：距离中心小于平均距离的 center_threshold_ratio 倍
+    float center_threshold = mean_dist * center_threshold_ratio;
+
+    // 剔除中心光斑
+    std::vector<SpotDetectionResult> filtered;
+    int removed_count = 0;
+    for (size_t i = 0; i < spots.size(); ++i) {
+        if (distances[i] > center_threshold) {
+            filtered.push_back(spots[i]);
+        } else {
+            removed_count++;
+        }
+    }
+
+    if (removed_count > 0) {
+        std::cout << "[CornealSpotDetector] 剔除中心光斑: " << removed_count
+                  << " 个 (阈值=" << center_threshold << ", 平均距离=" << mean_dist << ")" << std::endl;
+    }
+
+    return filtered;
+}
+
 cv::Point2f CornealSpotDetector::ComputeGeometricCenter(
     const std::vector<SpotDetectionResult>& spots) {
 
@@ -754,6 +837,13 @@ bool CornealSpotDetector::DetectAndAnalyze(
         spots = RemoveOutliers(spots);
         std::cout << "[CornealSpotDetector] 离群值去除后: " << spots.size() << std::endl;
 
+        // 8.5. 计算几何中心（用于剔除中心光斑）
+        cv::Point2f geometric_center = ComputeGeometricCenter(spots);
+
+        // 8.6. 剔除中心光斑（在内外环分离之前，避免中心光斑影响椭圆拟合）
+        spots = RemoveCenterSpots(spots, geometric_center, 0.3f);
+        std::cout << "[CornealSpotDetector] 中心光斑剔除后: " << spots.size() << std::endl;
+
         // 9. 数量检查
         if (static_cast<int>(spots.size()) < min_spots) {
             result.error_message = "光斑数量过少 (" + std::to_string(spots.size()) +
@@ -769,9 +859,9 @@ bool CornealSpotDetector::DetectAndAnalyze(
             return false;
         }
 
-        // 10. 计算统计信息
+        // 10. 计算统计信息（使用剔除中心光斑后的数据重新计算几何中心）
         result.num_spots = static_cast<int>(spots.size());
-        result.geometric_center = ComputeGeometricCenter(spots);
+        result.geometric_center = ComputeGeometricCenter(spots);  // 重新计算，排除中心光斑的影响
         result.avg_aspect_ratio = ComputeAverageAspectRatio(spots);
         result.all_spots = spots;
 
