@@ -118,10 +118,10 @@ int main(int argc, char** argv) {
     // 检测参数
     float conf_threshold = 0.25f;
     float nms_threshold = 0.45f;
-    int min_spots = 1;  // 最少光斑数（调整为更宽松的值）
+    int min_spots = 29;  // 最少光斑数（调整为更宽松的值）
     int max_spots = 32;  // 最多光斑数
-    float min_aspect_ratio = 0.1f;  // 最小长宽比（放宽限制）
-    float max_aspect_ratio = 10.0f;  // 最大长宽比（放宽限制）
+    float min_aspect_ratio = 0.5f;  // 最小长宽比（放宽限制）
+    float max_aspect_ratio = 2.0f;  // 最大长宽比（放宽限制）
     int enable_ellipse_fit = 1;     // 启用椭圆拟合
     
     pupil_result.cropped_image = image;
