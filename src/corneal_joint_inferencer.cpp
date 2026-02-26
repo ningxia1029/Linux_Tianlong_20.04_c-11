@@ -12,6 +12,7 @@
 #include <map>
 #include <set>
 #include <sstream>  // 替代 QDebug
+#include <random>
 
 // ============================================================================
 // 辅助函数：将相对路径转换为绝对路径
@@ -501,7 +502,7 @@ bool PupilDetector::DetectPupil(const cv::Mat& image,
 
         // 9. 裁剪 640x640 图像
         result.cropped_image = CropCenterRegion(image, result.center);
-
+        
         std::cout << "[PupilDetector] 检测成功: center=(" << result.center.x
                   << ", " << result.center.y << "), half_width=" << result.half_width
                   << ", conf=" << result.confidence << std::endl;
@@ -657,6 +658,13 @@ bool PupilDetector::DetectPupilAdaptive(const cv::Mat& image,
         result.half_width = (best_box.width + best_box.height) / 4.0f;
         result.confidence = best_score;
         result.box = best_box;
+
+        // 10. 裁剪 640x640 图像（以检测到的瞳孔中心为中心）
+        result.cropped_image = CropCenterRegion(image, result.center);
+        std::cout << "[PupilDetector] cropped_image empty: "
+                  << (result.cropped_image.empty() ? 1 : 0)
+                  << ", size=" << result.cropped_image.cols
+                  << "x" << result.cropped_image.rows << std::endl;
 
         std::cout << "[PupilDetector] 检测成功: center=(" << result.center.x
                  << "," << result.center.y << "), half_width=" << result.half_width
@@ -1160,7 +1168,7 @@ std::vector<SpotDetectionResult> CornealSpotDetector::RemoveOutliers(
         points.push_back(spots[i].keypoint);
     }
 
-    // 自动计算eps（基于平均距离的百分比）
+    // 计算几何中心和到中心的距离
     cv::Point2f center = ComputeGeometricCenter(spots);
     std::vector<float> distances;
     for (size_t i = 0; i < spots.size(); ++i) {
@@ -1177,15 +1185,23 @@ std::vector<SpotDetectionResult> CornealSpotDetector::RemoveOutliers(
         sq_sum += (d - mean_dist) * (d - mean_dist);
     }
     float std_dist = std::sqrt(sq_sum / distances.size());
+    float min_dist = *std::min_element(distances.begin(), distances.end());
+    float max_dist = *std::max_element(distances.begin(), distances.end());
 
-    // eps设为平均距离的28-32%，适合环状结构
-    float eps = mean_dist * 0.28f;
-    // 如果标准差较大，说明有内外环，可以适当增大eps
-    if (std_dist > mean_dist * 0.3f) {
-        eps = mean_dist * 0.32f;
-    }
+    // === 调试信息：打印距离统计（精简版，不打印每个光斑详情） ===
+    std::cout << "[CornealSpotDetector] [DBSCAN] 几何中心=(" << center.x << ", " << center.y << ")" << std::endl;
+    std::cout << "[CornealSpotDetector] [DBSCAN] 距离统计: mean=" << mean_dist
+              << " std=" << std_dist << " min=" << min_dist << " max=" << max_dist << std::endl;
 
+    // eps策略：内外环各N个光斑时，环上相邻弦长 = 2*R*sin(π/N)
+    // 典型N=16，内环R≈0.86*mean_dist，外环R≈1.14*mean_dist
+    // 外环相邻弦长 ≈ 2*1.14*mean_dist*sin(π/16) ≈ 0.45*mean_dist
+    // eps设为0.55*mean_dist，略大于最大可能弦长，确保环上点可以连成cluster
+    float eps = mean_dist * 0.55f;
     int min_samples = 3;  // DBSCAN最小样本数
+
+    std::cout << "[CornealSpotDetector] [DBSCAN] eps=" << eps
+              << " (= mean_dist*0.55), min_samples=" << min_samples << std::endl;
 
     // 执行DBSCAN聚类
     std::vector<int> labels = dbscan(points, eps, min_samples);
@@ -1199,45 +1215,30 @@ std::vector<SpotDetectionResult> CornealSpotDetector::RemoveOutliers(
     }
 
     if (cluster_sizes.empty()) {
-        // 如果所有点都是噪声，返回原列表
+        // 如果所有点都是噪声（eps太小），返回原列表
         std::cout << "[CornealSpotDetector] [DBSCAN] 警告：所有点都被标记为噪声，返回所有点" << std::endl;
         return spots;
     }
 
-    // 找到最大的两个cluster
-    std::vector<std::pair<int, int>> sorted_clusters(cluster_sizes.begin(), cluster_sizes.end());
-    std::sort(sorted_clusters.begin(), sorted_clusters.end(),
-              [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
-                  return a.second > b.second;  // 按大小降序排序
-              });
-
-    std::set<int> top2_clusters;
-    for (size_t i = 0; i < std::min(size_t(2), sorted_clusters.size()); ++i) {
-        top2_clusters.insert(sorted_clusters[i].first);
-    }
-
-    // 只保留属于最大两个cluster的光斑
+    // 新策略：只去除DBSCAN明确标记为噪声（label=-1）的孤立点，保留所有cluster中的点
+    // 原策略（只保留最大2个cluster）会把环上正常光斑丢弃，导致数量严重不足
     std::vector<SpotDetectionResult> filtered;
     int noise_count = 0;
-    int removed_cluster_count = 0;
 
     for (size_t i = 0; i < spots.size(); ++i) {
         if (labels[i] == -1) {
             noise_count++;
-        } else if (top2_clusters.find(labels[i]) != top2_clusters.end()) {
-            filtered.push_back(spots[i]);
+            std::cout << "[CornealSpotDetector] [DBSCAN] 去除孤立噪声点[" << i << "]: pos=("
+                      << spots[i].keypoint.x << ", " << spots[i].keypoint.y
+                      << ")  dist=" << distances[i] << std::endl;
         } else {
-            removed_cluster_count++;
+            filtered.push_back(spots[i]);
         }
     }
 
-    std::cout << "[CornealSpotDetector] [DBSCAN] eps=" << eps
-              << ", min_samples=" << min_samples << std::endl;
     std::cout << "[CornealSpotDetector] [DBSCAN] 发现 " << cluster_sizes.size()
-              << " 个cluster，保留最大的2个" << std::endl;
-    std::cout << "[CornealSpotDetector] [DBSCAN] 去除噪声点: " << noise_count
-              << " 个, 去除其他cluster: " << removed_cluster_count << " 个" << std::endl;
-    std::cout << "[CornealSpotDetector] [DBSCAN] 保留光斑: " << filtered.size() << " 个" << std::endl;
+              << " 个cluster，去除孤立噪声: " << noise_count
+              << " 个，保留: " << filtered.size() << " 个" << std::endl;
 
     return filtered;
 }
@@ -1355,6 +1356,57 @@ std::vector<SpotDetectionResult> CornealSpotDetector::RemoveDistantSpots(
     return filtered;
 }
 
+std::vector<SpotDetectionResult> CornealSpotDetector::RemoveSmallAreaSpots(
+    const std::vector<SpotDetectionResult>& spots,
+    float min_area_ratio) {
+
+    if (spots.size() < 3) {
+        return spots;
+    }
+
+    // 计算所有光斑的面积（使用检测框的宽×高）
+    std::vector<float> areas;
+    for (size_t i = 0; i < spots.size(); ++i) {
+        const SpotDetectionResult& spot = spots[i];
+        float area = static_cast<float>(spot.box.width * spot.box.height);
+        areas.push_back(area);
+    }
+
+    // 计算平均面积和标准差
+    float mean_area = std::accumulate(areas.begin(), areas.end(), 0.0f) / areas.size();
+    float sq_sum = 0.0f;
+    for (size_t i = 0; i < areas.size(); ++i) {
+        float a = areas[i];
+        sq_sum += (a - mean_area) * (a - mean_area);
+    }
+    float std_dev = std::sqrt(sq_sum / areas.size());
+
+    // 计算最小允许面积：均值 - min_area_ratio * 标准差
+    // 这样可以去除那些被遮挡导致面积明显偏小的光斑
+    float min_allowed_area = mean_area - min_area_ratio * std_dev;
+    // 确保最小面积不为负
+    min_allowed_area = std::max(0.0f, min_allowed_area);
+
+    // 过滤掉面积过小的光斑
+    std::vector<SpotDetectionResult> filtered;
+    int removed_count = 0;
+    for (size_t i = 0; i < spots.size(); ++i) {
+        if (areas[i] >= min_allowed_area) {
+            filtered.push_back(spots[i]);
+        } else {
+            removed_count++;
+        }
+    }
+
+    if (removed_count > 0) {
+        std::cout << "[CornealSpotDetector] 去除面积过小的光斑: " << removed_count
+                  << " 个 (平均面积=" << mean_area << ", 最小允许面积="
+                  << min_allowed_area << ")" << std::endl;
+    }
+
+    return filtered;
+}
+
 float CornealSpotDetector::ComputeAverageAspectRatio(
     const std::vector<SpotDetectionResult>& spots) {
 
@@ -1371,39 +1423,290 @@ float CornealSpotDetector::ComputeAverageAspectRatio(
     return sum / spots.size();
 }
 
+// 使用三个点拟合圆（用于RANSAC），失败返回false
+static bool fitCircleFrom3Points(const cv::Point2f& p1,
+                                 const cv::Point2f& p2,
+                                 const cv::Point2f& p3,
+                                 cv::Point2f& center,
+                                 float& radius) {
+    // 参考几何推导的三点确定圆公式
+    float A = p2.x - p1.x;
+    float B = p2.y - p1.y;
+    float C = p3.x - p1.x;
+    float D = p3.y - p1.y;
+
+    float E = A * (p1.x + p2.x) + B * (p1.y + p2.y);
+    float F = C * (p1.x + p3.x) + D * (p1.y + p3.y);
+    float G = 2.0f * (A * (p3.y - p2.y) - B * (p3.x - p2.x));
+
+    if (std::fabs(G) < 1e-6f) {
+        // 三点近乎共线，无法唯一确定圆
+        return false;
+    }
+
+    center.x = (D * E - B * F) / G;
+    center.y = (A * F - C * E) / G;
+    radius = std::sqrt((center.x - p1.x) * (center.x - p1.x) +
+                       (center.y - p1.y) * (center.y - p1.y));
+    return std::isfinite(radius) && radius > 0.0f;
+}
+
+cv::Point2f CornealSpotDetector::EstimateRobustCenterRANSAC(
+    const std::vector<SpotDetectionResult>& spots,
+    const cv::Point2f& initial_center,
+    float inlier_threshold,
+    int max_iterations,
+    int* best_inlier_count) {
+
+    if (spots.size() < 3) {
+        if (best_inlier_count) {
+            *best_inlier_count = static_cast<int>(spots.size());
+        }
+        return initial_center;
+    }
+
+    // 将光斑坐标提取为点集合
+    std::vector<cv::Point2f> points;
+    points.reserve(spots.size());
+    for (size_t i = 0; i < spots.size(); ++i) {
+        points.push_back(spots[i].keypoint);
+    }
+
+    std::mt19937 rng(static_cast<unsigned int>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+    std::uniform_int_distribution<int> dist(0, static_cast<int>(points.size()) - 1);
+
+    cv::Point2f best_center = initial_center;
+    float best_radius = 0.0f;
+    int best_inliers_local = 0;
+
+    const float min_radius = 5.0f;  // 物理上不可能太小，避免退化解
+
+    for (int iter = 0; iter < max_iterations; ++iter) {
+        // 随机选取3个不同点
+        int idx1 = dist(rng);
+        int idx2 = dist(rng);
+        int idx3 = dist(rng);
+        // 确保三点互不相同
+        for (int guard = 0; guard < 10 && (idx2 == idx1); ++guard) {
+            idx2 = dist(rng);
+        }
+        for (int guard = 0; guard < 10 && (idx3 == idx1 || idx3 == idx2); ++guard) {
+            idx3 = dist(rng);
+        }
+        if (idx1 == idx2 || idx1 == idx3 || idx2 == idx3) {
+            continue;
+        }
+
+        cv::Point2f c;
+        float r = 0.0f;
+        if (!fitCircleFrom3Points(points[idx1], points[idx2], points[idx3], c, r)) {
+            continue;
+        }
+        if (r < min_radius || !std::isfinite(c.x) || !std::isfinite(c.y)) {
+            continue;
+        }
+
+        // 统计内点：以"到中心的距离与拟合半径之差"作为残差
+        int inliers = 0;
+        for (size_t i = 0; i < points.size(); ++i) {
+            float dx = points[i].x - c.x;
+            float dy = points[i].y - c.y;
+            float dist_to_center = std::sqrt(dx * dx + dy * dy);
+            float residual = std::fabs(dist_to_center - r);
+            if (residual <= inlier_threshold) {
+                ++inliers;
+            }
+        }
+
+        if (inliers > best_inliers_local) {
+            best_inliers_local = inliers;
+            best_center = c;
+            best_radius = r;
+        }
+    }
+
+    // 如果RANSAC未找到比初始中心更好的结果，则退回几何中心
+    if (best_inliers_local < 3 || best_radius <= 0.0f) {
+        if (best_inlier_count) {
+            *best_inlier_count = static_cast<int>(spots.size());
+        }
+        return initial_center;
+    }
+
+    if (best_inlier_count) {
+        *best_inlier_count = best_inliers_local;
+    }
+
+    std::cout << "[CornealSpotDetector] RANSAC鲁棒中心: ("
+              << best_center.x << ", " << best_center.y
+              << "), 半径≈" << best_radius
+              << ", 内点数=" << best_inliers_local
+              << "/" << spots.size() << std::endl;
+
+    return best_center;
+}
+
 void CornealSpotDetector::SeparateInnerOuter(
     const std::vector<SpotDetectionResult>& spots,
     const cv::Point2f& center,
     std::vector<SpotDetectionResult>& inner,
     std::vector<SpotDetectionResult>& outer) {
 
-    if (spots.size() < 2) {
+    inner.clear();
+    outer.clear();
+
+    if (spots.size() < 4) {
+        // 点太少，无法稳定分环，全部归为外环以保证后续流程不中断
+        outer = spots;
         return;
     }
 
-    // 计算所有点到中心的距离
-    std::vector<float> distances;
-    for (size_t i = 0; i < spots.size(); ++i) {
+    const size_t N = spots.size();
+
+    // 1. 计算所有点的极坐标（相对给定中心）
+    struct PolarSample {
+        size_t index;
+        float radius;
+        float angle;  // [-pi, pi]
+    };
+
+    std::vector<PolarSample> polar_samples;
+    polar_samples.reserve(N);
+    std::vector<float> radii;
+    radii.reserve(N);
+
+    for (size_t i = 0; i < N; ++i) {
         const SpotDetectionResult& spot = spots[i];
         float dx = spot.keypoint.x - center.x;
         float dy = spot.keypoint.y - center.y;
-        float dist = std::sqrt(dx * dx + dy * dy);
-        distances.push_back(dist);
+        float r = std::sqrt(dx * dx + dy * dy);
+        float ang = std::atan2(dy, dx);
+        polar_samples.push_back({i, r, ang});
+        radii.push_back(r);
     }
 
-    // 使用中位数作为分界
-    std::vector<float> sorted_distances = distances;
-    std::sort(sorted_distances.begin(), sorted_distances.end());
-    float median_dist = sorted_distances[sorted_distances.size() / 2];
+    // 2. 对半径做 1D k-means (k=2)
+    const int K = 2;
+    std::vector<float> centers(K, 0.0f);
 
-    // 分离
-    for (size_t i = 0; i < spots.size(); ++i) {
-        if (distances[i] < median_dist) {
+    // 初始化：用最小半径和最大半径作为两个类中心
+    auto minmax_it = std::minmax_element(radii.begin(), radii.end());
+    centers[0] = *minmax_it.first;
+    centers[1] = *minmax_it.second;
+
+    std::vector<int> labels(N, 0);
+    bool changed = true;
+    const int max_kmeans_iters = 20;
+
+    for (int iter = 0; iter < max_kmeans_iters && changed; ++iter) {
+        changed = false;
+
+        // 2.1 赋值
+        for (size_t i = 0; i < N; ++i) {
+            float r = radii[i];
+            float dist0 = std::fabs(r - centers[0]);
+            float dist1 = std::fabs(r - centers[1]);
+            int new_label = (dist0 <= dist1) ? 0 : 1;
+            if (labels[i] != new_label) {
+                labels[i] = new_label;
+                changed = true;
+            }
+        }
+
+        // 2.2 重新计算类中心
+        float sum[2] = {0.0f, 0.0f};
+        int count[2] = {0, 0};
+        for (size_t i = 0; i < N; ++i) {
+            int l = labels[i];
+            sum[l] += radii[i];
+            ++count[l];
+        }
+
+        // 如果某个簇为空，说明当前初始化不合适，直接退回到中位数方法
+        if (count[0] == 0 || count[1] == 0) {
+            std::vector<float> sorted_r = radii;
+            std::sort(sorted_r.begin(), sorted_r.end());
+            float median_r = sorted_r[sorted_r.size() / 2];
+            for (size_t i = 0; i < N; ++i) {
+                if (radii[i] < median_r) {
+                    inner.push_back(spots[i]);
+                } else {
+                    outer.push_back(spots[i]);
+                }
+            }
+            std::cout << "[CornealSpotDetector] k-means 分簇失败，回退到中位数分环" << std::endl;
+            return;
+        }
+
+        centers[0] = sum[0] / static_cast<float>(count[0]);
+        centers[1] = sum[1] / static_cast<float>(count[1]);
+    }
+
+    // 3. 根据类中心半径大小，确定哪个是内环簇、哪个是外环簇
+    int inner_label = (centers[0] <= centers[1]) ? 0 : 1;
+    int outer_label = 1 - inner_label;
+
+    // 4. 角度一致性 / 简单平滑：按角度bin统计每个bin中内/外环占比，修正局部孤立错误
+    const int num_angle_bins = 36;  // 每10度一个bin
+    struct BinStat {
+        int inner_count = 0;
+        int outer_count = 0;
+    };
+    std::vector<BinStat> bin_stats(num_angle_bins);
+    std::vector<int> bin_index(N, 0);
+
+    for (size_t i = 0; i < N; ++i) {
+        float ang = polar_samples[i].angle;               // [-pi, pi]
+        float ang_norm = (ang + static_cast<float>(CV_PI));  // [0, 2pi]
+        float bin_f = ang_norm / (2.0f * static_cast<float>(CV_PI)) * num_angle_bins;
+        int b = static_cast<int>(std::floor(bin_f));
+        if (b < 0) b = 0;
+        if (b >= num_angle_bins) b = num_angle_bins - 1;
+        bin_index[i] = b;
+
+        if (labels[i] == inner_label) {
+            bin_stats[b].inner_count++;
+        } else {
+            bin_stats[b].outer_count++;
+        }
+    }
+
+    // 针对每个点，如果所在角度bin中另一类明显占优且当前类数量为1，则按多数类修正
+    for (size_t i = 0; i < N; ++i) {
+        int b = bin_index[i];
+        BinStat& s = bin_stats[b];
+        int cur_label = labels[i];
+        int cur_is_inner = (cur_label == inner_label) ? 1 : 0;
+        int bin_inner = s.inner_count;
+        int bin_outer = s.outer_count;
+
+        if (cur_is_inner) {
+            // 当前标为内环，但bin中外环点很多而内环只有1个，认为是误分
+            if (bin_inner == 1 && bin_outer >= 3) {
+                labels[i] = outer_label;
+            }
+        } else {
+            // 当前标为外环，但bin中内环点很多而外环只有1个
+            if (bin_outer == 1 && bin_inner >= 3) {
+                labels[i] = inner_label;
+            }
+        }
+    }
+
+    // 5. 根据最终标签填充内外环点集
+    for (size_t i = 0; i < N; ++i) {
+        if (labels[i] == inner_label) {
             inner.push_back(spots[i]);
         } else {
             outer.push_back(spots[i]);
         }
     }
+
+    std::cout << "[CornealSpotDetector] k-means 分环完成: 内环=" << inner.size()
+              << ", 外环=" << outer.size()
+              << ", r_inner≈" << centers[inner_label]
+              << ", r_outer≈" << centers[outer_label] << std::endl;
 }
 
 EllipseFitResult CornealSpotDetector::FitEllipse(
@@ -1747,9 +2050,14 @@ bool CornealSpotDetector::DetectAndAnalyze(
             std::cout << "[CornealSpotDetector] 排序后保留: " << spots.size() << " 个光斑" << std::endl;
         }
 
-        // 10. 计算统计信息（使用剔除中心光斑后的数据重新计算几何中心）
+        // 10. 先用几何中心做初值，然后通过RANSAC在圆/椭圆分布的光斑上估计鲁棒中心
         result.num_spots = static_cast<int>(spots.size());
-        result.geometric_center = ComputeGeometricCenter(spots);  // 重新计算，排除中心光斑的影响
+        cv::Point2f geometric_center2 = ComputeGeometricCenter(spots);  // 排除中心光斑后的几何中心
+        int ransac_inliers = 0;
+        cv::Point2f robust_center = EstimateRobustCenterRANSAC(
+            spots, geometric_center2, 5.0f, 200, &ransac_inliers);
+
+        result.geometric_center = robust_center;
         result.avg_aspect_ratio = ComputeAverageAspectRatio(spots);
         result.all_spots = spots;
 
@@ -1773,6 +2081,13 @@ bool CornealSpotDetector::DetectAndAnalyze(
             result.outer_spots = RemoveDistantSpots(result.outer_spots, result.geometric_center, 1.5f);
 
             std::cout << "[CornealSpotDetector] 距离过滤后 - 内环: " << result.inner_spots.size()
+                      << ", 外环: " << result.outer_spots.size() << std::endl;
+
+            // 11.6. 基于面积的异常值剔除（去除被遮挡导致面积过小的光斑）
+            result.inner_spots = RemoveSmallAreaSpots(result.inner_spots, 2.0f);
+            result.outer_spots = RemoveSmallAreaSpots(result.outer_spots, 2.0f);
+
+            std::cout << "[CornealSpotDetector] 面积过滤后 - 内环: " << result.inner_spots.size()
                       << ", 外环: " << result.outer_spots.size() << std::endl;
 
             // 12. 椭圆拟合（内部会进行长宽比验证）
@@ -1965,7 +2280,7 @@ cv::Mat CornealSpotDetector::DrawMaskResult(const cv::Mat& image,
                                            const CornealSpotAnalysisResult& result) {
     cv::Mat vis = image.clone();
     
-    if (!result.valid || result.segmentation_mask.empty()) {
+    if (result.segmentation_mask.empty()) {
         return vis;
     }
     
